@@ -9,5 +9,6 @@
     "commands": [
         "yum clean all",
         "yum update -y"
-    ]
+    ],
+    "idempotent": false
 }
