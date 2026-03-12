@@ -5,8 +5,11 @@ Gather the information provided by ``opkg`` on OpenWrt systems:
     + list of installed packages
     + list of packages with available upgrades
 
+See https://openwrt.org/docs/guide-user/additional-software/opkg.
 
-    see https://openwrt.org/docs/guide-user/additional-software/opkg
+**Note:** as of OpenWrt Release `2025.12`_, OpenWrt uses ``apk``.
+
+.. _2025.12: https://openwrt.org/releases/25.12/notes-25.12.0#switch_package_manager_from_opkg_to_apk
 """
 
 import re
@@ -18,7 +21,7 @@ from pyinfra import logger
 from pyinfra.api import FactBase
 from pyinfra.facts.util.packaging import parse_packages
 
-# TODO - change NamedTuple to dataclass Opkgbut need to figure out how to get json serialization
+# TODO - change NamedTuple to dataclass Opkg but need to figure out how to get json serialization
 #        to work without changing core code
 
 
