@@ -11,11 +11,14 @@ from __future__ import annotations
 import re
 import shlex
 import stat
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union, get_args
 
+import dateutil.parser
 from typing_extensions import Literal, NotRequired, TypedDict, override
 
+from pyinfra import logger
 from pyinfra.api import StringCommand
 from pyinfra.api.command import QuoteString, make_formatted_string_command
 from pyinfra.api.facts import FactBase
@@ -684,3 +687,150 @@ class FileContents(FactBase):
         if output and output[0] == self.missing_flag:
             return None
         return output
+
+
+ERROR = "_pyinfra_error"
+
+ArchiveFormatType = Literal["bz2", "gz", "tar", "xz", "zip", "zstd"]
+KNOWN_ARCHIVE_KINDS = set(get_args(ArchiveFormatType))
+
+
+class ArchInfo(NamedTuple):
+    archive: list[str]
+    compress: list[str]
+    unarchive: list[str]
+    uncompress: list[str]
+    view_toc: list[str]
+
+
+TAR_NO_PIPE = ["tar", "cf"]
+TAR = [*TAR_NO_PIPE, "|"]
+UNTAR = ["|", "tar", "xf"]
+VIEW_TAR = ["|", "tar", "tvf", "-"]
+
+ARCH_INFO = {
+    "bz2": ArchInfo(TAR, ["|", "bzip2"], UNTAR, ["bzcat"], VIEW_TAR),
+    "gz": ArchInfo(TAR, ["|", "gzip"], UNTAR, ["gzcat"], VIEW_TAR),
+    "tar": ArchInfo(TAR_NO_PIPE, [], UNTAR, ["cat"], VIEW_TAR),
+    "xz": ArchInfo(TAR, ["|", "xz"], UNTAR, ["xzcat"], VIEW_TAR),
+    "zip": ArchInfo([], ["zip", "-r"], [], ["unzip", "-q"], ["unzip", "-Zl"]),
+    "zstd": ArchInfo(TAR, ["|", "zstd"], UNTAR, ["zstdcat"], VIEW_TAR),
+}
+if set(ARCH_INFO) != KNOWN_ARCHIVE_KINDS:
+    raise RuntimeError("ARCH_INFO keys do not match KNOWN_ARCHIVE_KINDS")
+
+
+class TocEntry(NamedTuple):
+    name: str
+    size: int
+    timestamp: datetime
+
+
+# example: -rw-r--r--  3.0 unx    20578 tx     7960 defN 26-Mar-15 17:33 CHANGELOG.md
+ZIP_REGEX = re.compile(
+    r"""
+                        ^
+                        \s*
+                        (?P<perms>[^\s]+)\s+
+                        ([^\s]+\s+){2}
+                        (?P<size>\d+)\s+
+                        ([^\s]+\s+){3}
+                        (?P<datetime>[^\s]+\s[^\s]+)\s+
+                        (?P<name>.*)
+                        $
+                        """,
+    re.VERBOSE,
+)
+
+# example: rw-r--r--  0 james  staff   20578 Mar 15 17:33 CHANGELOG.md
+TAR_REGEX = re.compile(
+    r"""
+                        ^
+                        \s*
+                        (?P<perms>[^\s]+)\s+
+                        ([^\s]+\s+){3}
+                        (?P<size>\d+)\s+
+                        (?P<datetime>[^\s]+\s[^\s]+\s[^\s]+)\s+
+                        (?P<name>.*)
+                        $
+                        """,
+    re.VERBOSE,
+)
+
+
+class ArchiveFiles(FactBase[list[TocEntry] | None]):
+    """
+    Returns the list of files contained in the archive.
+
+    + path: path to the archive
+    + kind: format of archive: : ``bz2``, ``gz``, ``xz``, ``zip``, ``zstd`` or ``tar``
+
+    Returns None if ``path`` doesn't exist and [] if the archive can't be read.
+    """
+
+    # NOTE: to maximize portability only tar is used, not gtar
+
+    @staticmethod
+    def default() -> list[TocEntry] | None:
+        return []
+
+    @override
+    def requires_command(self, path: str, fmt: ArchiveFormatType) -> str | None:  # noqa: ARG002
+        """
+        Make sure we have the command we need for this kind of archive.
+        Only 'tar' is required, not 'gtar' to maximize portability at the cost of some
+        complexity in the
+        """
+        # FIXME - need decompressor as well as tar but not clear how to require multiple commands
+        # bad format caught in command which, at least today, is called before requires_command
+        return ARCH_INFO[fmt].view_toc[0]
+
+    @override
+    def command(self, path: str, fmt: ArchiveFormatType) -> StringCommand | str:
+        if fmt not in KNOWN_ARCHIVE_KINDS:
+            raise ValueError(f"Unsupported archive format: '{fmt}'")
+
+        self.fmt = fmt
+        path_q = QuoteString(path)  # FIXME - need QuotePath that doesn't quote ~ at start of path
+        if fmt == "zip":
+            cmd = [*ARCH_INFO[fmt].view_toc, path_q]
+        else:
+            cmd = [
+                *ARCH_INFO[fmt].uncompress,
+                path_q,
+                *ARCH_INFO[fmt].view_toc,
+                # failure of decompressor doesn't propagate across pipe (no pipefail in sh) so check
+                *["&&", "[[", "${PIPESTATUS[0]}", "-eq", "0", "]]"],
+            ]
+        cmd = [*cmd, "||", "echo", ERROR]
+        exists = ["(", "test", "-f", path_q, "||", "test", "-L", path_q, ")"]
+        return StringCommand(*exists, "&&", "(", *cmd, ")", "2>/dev/null", "||", "echo", MISSING)
+
+    def output_to_entries(self, output: Iterable[str], regex: re.Pattern[str]) -> list[TocEntry]:
+        result = []
+        for line in output:
+            if (match := regex.match(line)) is not None:
+                ts = dateutil.parser.parse(match.group("datetime"))  # TODO handle convert errors
+                result.append(TocEntry(match.group("name"), int(match.group("size")), ts))
+            else:
+                logger.warning(f"could not parse {self.fmt} table of contents entry: {line}")
+        return result
+
+    @override
+    def process(self, output: Sequence[str]) -> list[TocEntry] | None:
+        """
+        Parse through the results.
+        Return NONE if the file was MISSING and the empty list ([]) if there were errors with
+        getting the list of files.
+        """
+        if output[0] == MISSING:
+            return None
+
+        if self.fmt != "zip":
+            return [] if output[0] == ERROR else self.output_to_entries(output, TAR_REGEX)
+
+        # for zip ignore first line which is Archive:  <path> when checking for error
+        if any(output[idx] == ERROR for idx in [0, 1, -1]):  # seems ouput on both stdout & stderr
+            return []
+        # for zip, skip the first two lines and the last line
+        return self.output_to_entries(output[2:-1], ZIP_REGEX)

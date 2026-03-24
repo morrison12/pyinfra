@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import os
 import posixpath
+import shlex
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from io import StringIO
 from pathlib import Path
-from typing import IO, Any, Union
+from typing import IO, Any, Literal, Union
 
 import click
 from jinja2 import TemplateRuntimeError, TemplateSyntaxError, UndefinedError
@@ -41,13 +42,17 @@ from pyinfra.api.util import (
     memoize,
 )
 from pyinfra.facts.files import (
+    ARCH_INFO,
+    KNOWN_ARCHIVE_KINDS,
     MARKER_BEGIN_DEFAULT,
     MARKER_DEFAULT,
     MARKER_END_DEFAULT,
+    ArchiveFormatType,
     Block,
     Directory,
     File,
     FileContents,
+    FileDict,
     FindFiles,
     FindInFile,
     FindLinks,
@@ -2066,3 +2071,264 @@ def block(
         else:
             cmd = StringCommand(f"awk '/{mark_1}/,/{mark_2}/ {{next}} 1'")
             yield StringCommand(out_prep, cmd, q_path, "> $OUT", real_out)
+
+
+def set_user_group_and_or_mode(
+    path: str,
+    user: str | None,
+    group: str | None,
+    mode: str | int | None,
+    *,
+    info: FileDict | Literal[False] | None = None,
+    recursive: bool | None = None,
+):
+    info = info or host.get_fact(File, path=path)
+
+    if mode and (not info or info["mode"] != mode):
+        yield file_utils.chmod(path, mode, recursive=recursive or False)
+
+    if (user and (not info or info["user"] != user)) or (
+        group and (not info or info["group"] != group)
+    ):
+        yield file_utils.chown(path, user, group, recursive=recursive or False)
+
+
+@operation()
+def archive(
+    path: str | list[str],
+    dest: str,
+    *,
+    fmt: ArchiveFormatType = "gz",
+    user: str | None = None,
+    group: str | None = None,
+    mode: str | int | None = None,
+):
+    """
+    Creates an archive from the specified file(s).
+
+    + path: path, glob or list thereof for the file for files to compress and archive.
+    + dest: path to the destination archive (the parent directory must exist).
+    # TODO -add exclude_path
+    # TODO - add exclusion pattern ????
+    + fmt: type of compression to be used: `bz2`, `gz`, `xz`, `zip`, `zstd` `tar` for none.
+    Default `gz`.
+    + user: user to own the archive
+    + group: group to own the archive
+    + mode: permissions of the archive in either numerical (e.g. 0755) or alpha (e.g. "u=rw") format
+
+    **Examples:**
+
+    .. code:: python
+
+       files.archive(
+        name = "Create a gzip-compressed tar archive of /path/to/somewhere",
+        path = "/path/to/somewhere",
+        dest = "/path/to/somewhere.tgz"
+      )
+
+      files.archive(
+        name = "Create a zip archive of /path/to/somewhere",
+        path = "/path/to/somewhere",
+        dest = "/path/to/somewhere.zip"
+        format = "zip"
+      )
+
+      files.archive(
+        name = "compress /path/to/single/file using xz compression",
+        path = "path/to/single/file",
+        dest = "path/to/single/file.xz",
+        format = "xz"
+      )
+
+      files.archive(
+        name = "create a single-file archive from /path/to/single/file using bzip2 compression",
+        path = "path/to/single/file",
+        dest = "path/to/single/file.tgz",
+        format = "bz2",
+        force_archive = True
+      )
+
+    """
+    # QUESTIONS:
+    #       1) do we need "extra_ops" ? extra_compressor_opts and extra_tar_opts ?
+    #
+    # NOTE: compared to ansible:
+    #       1) no attribute - pyinfra-wide topic
+    #       2) no force_archive: not sure special case of archiving a single file being "compress"
+    #          is worth it (incl. this flag to turn it off)
+    #       3) no remove - not clear how to tell what archive program actually updated
+    #       4) no se(level|role|type|user) - pyinfra-wide topic
+    #       5) no unsafe_writes - pyinfra-wide topic
+
+    # TODO -  exclude_path, exclusion_patterns given both zip and tar support to some degree
+
+    if fmt not in KNOWN_ARCHIVE_KINDS:
+        raise OperationError(f"Unsupported archive format: '{fmt}'")
+
+    if len(path := ([path] if isinstance(path, str) else (path or []))) < 1:
+        host.noop("no source paths specified")
+    else:
+        dest_q, dest_shq = QuoteString(dest), shlex.quote(dest)
+        path_q = [QuoteString(p) for p in path]
+        msg = ["echo", f"'pyinfra: parent of {dest} not found'", ">", "/dev/stderr"]
+        # note: can't use realpath as file doesn't exist
+        check = [
+            f"P={dest_shq}", # TODO - how to do this w/o shlex.quote, TODO - do we need this ?
+            ";",
+            "[",
+            "-d",
+            '"${P%/*}"',
+            "]",
+            "||",
+            "(",
+            *msg,
+            "&&",
+            "false",
+            ")",
+        ]
+        compressor = ARCH_INFO[fmt].compress
+        # FIXME - somehow detect zip complaining about missing files in stdout:
+        #   '\tzip warning: name not matched:
+        if fmt == "zip":
+            cmd = [*compressor, dest_q, *path_q]
+        else:
+            cmd = [
+                *["tar", "cvf"],
+                "-" if len(compressor) > 0 else dest_q,
+                *path_q,
+                *([*compressor, ">", dest_q] if len(compressor) > 0 else []),
+                *(
+                    ["&&", "[[", "${PIPESTATUS[0]}", "-eq", "0", "]]"]
+                    if len(compressor) > 0
+                    else []
+                ),
+            ]
+
+        yield StringCommand(*check, "&&", *cmd)
+
+        yield from set_user_group_and_or_mode(dest, user, group, mode)
+
+
+@operation()
+def unarchive(
+    archive: str,
+    dest: str,
+    *,
+    exclude: str | list[str] | None = None,
+    extra_opts: str | list[str] | None = None,
+    fmt: ArchiveFormatType = "gz",
+    include: str | list[str] | None = None,
+    keep_newer: bool = False,
+    user: str | None = None,
+    group: str | None = None,
+    mode: str | int | None = None,
+):
+    """
+    Unpack an archive into the given directory.
+
+    + archive: path to the source archive
+    + dest: path to the destination directory (must exist)
+    + exclude: list of directory and/or file entries to not be extracted. Default none.
+    + extra_opts: additional options to be passed to the unarchive command. Default none
+    + fmt: type of compression to be used: `bz2`, `gz`, `xz`, `zip`, `zstd` `tar` for none.
+    Default `gz`.
+    + include: list of directory and/or file entries to extract.  TBD default behavior.
+    Default none.
+    + keep_newer: do not replace files that are newer than the corresponding file from the archive.
+    Default False.
+    + user: user to own the extracted files
+    + group: group to own the extracted files
+    + mode: permissions of the extracted files in either numerical (e.g. 0755) or
+    alpha (e.g. "u=rw") format
+
+    **Examples:**
+
+    .. code:: python
+
+        files.unarchive(
+            name = "Extract files from foo.tgz into /path/to/somewhere",
+            src="foo.tgz",
+            dest="path/to/somewhere",
+            format = "gzip",
+        )
+
+        files.unarchive(
+            name = "Extract files from foo.tgz using extra options",
+            src="foo.zip",
+            dest="path/to/somwhere",
+            format="zip",
+            extra_opts = "--magic-option-42",
+        )
+
+    """
+    # TODO - add '    ``unarchive`` supports the same formats as :ref:_ops:archive' to the
+    #  docstring but fix reference format
+    # TODO - is it possible to create a constant in ReST to minimize maintenance ?
+    # TODO - add user/group/mode
+    # TODO: should we support io_buffer_size: "Size of the volatile memory buffer that
+    #  is used for extracting files from the archive in bytes."
+    #
+    # NOTE: compared to ansible:
+    #       1) no attributes - pyinfra-wide topic
+    #       2) no creates option - "If the specified absolute path (file or directory)
+    #          already exists, this step will not be run"
+    #           -- precede call to unarchive with if not host.get_fact(File, <archive>)
+    #       3) no copy/remote_src option - "Set to true to indicate the archived file is already on
+    #          the remote system and not local to the Ansible controller."
+    #            -- precede call to unarchive with files.download and follow it with a
+    #               files.file(..., present=False)
+    #            -- avoids replication of all of download's parameters (e.g. sha256sum)
+    #            -- would be nice to have download as a context manager
+    #               so it cleaned up after itself
+    #       4) no decrypt - no built in vault
+    #       5) no user, group, mode parameters - probably should add
+    #       6) no se(level|role|type|user) - pyinfra-wide topic
+    #       7) no unsafe_writes - pyinfra-wide topic
+    #       8) no validate_certs - only used with remote_src
+    #       9) has fmt when Ansible doesn't to avoid a loop trying to guess the format (plus ZoP)
+
+    def make_list(s: str | list[str] | None) -> list[str]:
+        return (s or []) if not isinstance(s, str) else [s]
+
+    if include and exclude:
+        raise OperationValueError("include and exclude are mutually exclusive")
+
+    exclude, extra_opts, include = make_list(exclude), make_list(extra_opts), make_list(include)
+
+    if fmt not in KNOWN_ARCHIVE_KINDS:
+        raise OperationValueError(f"Unsupported archive format: '{fmt}'")
+
+    src_q, dest_q = QuoteString(archive), QuoteString(dest)
+
+    msg = ["echo", f"'pyinfra: archive {archive} not found'", ">", "/dev/stderr"]
+    check_arch_exists = ["[", "-f", src_q, "]", "||", "(", *msg, "&&", "false", ")"]
+
+    decompressor = ARCH_INFO[fmt].uncompress
+    unarchiver = ARCH_INFO[fmt].unarchive
+    if fmt == "zip":
+        cmd = [
+            *decompressor,
+            f"-{'o' if not keep_newer else ''}",  # FIXME - implement keep_newer
+            *extra_opts,
+            src_q,
+            # *(QuoteString(path) for path in include),
+            # *(["-x", (QuoteString(path) for path in exclude)] if exclude else []),
+            "-d",
+            dest_q,
+        ]
+    else:  # thus tar (including only tar: uses cat to decompress)
+        cmd = [
+            *decompressor,
+            src_q,
+            *unarchiver,
+            "-",
+            # *(["--keep-newer-files"] if keep_newer else []),
+            *extra_opts,
+            # *[f"--exclude={shlex.quote(path)}" for path in exclude],
+            "-C",
+            dest_q,
+            # *(QuoteString(path) for path in include),
+        ]
+    yield StringCommand(*check_arch_exists, "&&", *cmd)
+    # FIXME - only want to change things _below_ path
+    yield from set_user_group_and_or_mode(dest, user, group, mode, recursive=True)
